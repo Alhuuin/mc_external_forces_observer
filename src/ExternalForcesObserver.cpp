@@ -47,7 +47,19 @@ void ExternalForcesObserver::configure(const mc_control::MCController & ctl,
   tau_momentum_observer_ = Eigen::VectorXd::Zero(nDof_);
   tau_ext_ft_sensor_ = Eigen::VectorXd::Zero(nDof_);
   integralTerm_ = Eigen::VectorXd::Zero(nDof_);
+  tau_contact_ = Eigen::VectorXd::Zero(nDof_);
   resetObserver_ = true;
+  if(ctl.dynamicsConstraint->backend() != mc_solver::QPSolver::Backend::TVM)
+  {
+    mc_rtc::log::warning(
+    "[ExternalForcesObserver] Contact-constraint torque compensation is only available with the TVM backend. " 
+    "The current backend will ignore torques induced by contact constraints, "
+    "which can lead to large errors in external force estimation when contacts are active.");
+  }
+  else
+  {
+    tau_contact_ = ctl.dynamicsConstraint->dynamicFunction().contactTorque();
+  }
 
   auto & realRobot = ctl.realRobot(robot_);
   const auto & forceSensors = realRobot.forceSensors();
@@ -102,6 +114,8 @@ bool ExternalForcesObserver::run(const mc_control::MCController & ctl)
 
 void ExternalForcesObserver::update(mc_control::MCController & ctl)
 {
+
+  tau_contact_ = ctl.dynamicsConstraint->dynamicFunction().contactTorque();
   if(activeHasChanged_ != isActive_)
   {
     activeHasChanged_ = isActive_;
@@ -352,7 +366,9 @@ void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
       mc_rtc::gui::ArrayLabel("Torque Ext from Momentum Observer", dofNames_,
                               [this]() { return tau_momentum_observer_; }),
       mc_rtc::gui::ArrayLabel("Torque Ext from Force Sensors", dofNames_,
-                              [this]() { return tau_ext_ft_sensor_; })
+                              [this]() { return tau_ext_ft_sensor_; }),
+      mc_rtc::gui::ArrayLabel("Torque Contact Compensation", dofNames_,
+                              [this]() { return tau_contact_; })
       );
 }
 
@@ -370,6 +386,7 @@ void ExternalForcesObserver::addToLogger(const mc_control::MCController & /* ctl
     logger.addLogEntry(category + "_tauMomentumObserver_" + dofNames_[i], this, [this, i]() { return tau_momentum_observer_(i); });
     logger.addLogEntry(category + "_integralTerm_" + dofNames_[i], this, [this, i]() { return integralTerm_(i); });
     logger.addLogEntry(category + "_tauExtFtSensor_" + dofNames_[i], this, [this, i]() { return tau_ext_ft_sensor_(i); });
+    logger.addLogEntry(category + "_tauContact_" + dofNames_[i], this, [this, i]() { return tau_contact_(i); });
   }
 }
 
