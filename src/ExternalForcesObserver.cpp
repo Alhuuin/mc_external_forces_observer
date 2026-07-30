@@ -49,6 +49,14 @@ void ExternalForcesObserver::configure(const mc_control::MCController & ctl,
   integralTerm_ = Eigen::VectorXd::Zero(nDof_);
   resetObserver_ = true;
 
+  auto & realRobot = ctl.realRobot(robot_);
+  const auto & forceSensors = realRobot.forceSensors();
+  if(forceSensors.empty() && useFTSensorMeasurements_)
+  {
+    mc_rtc::log::warning("[ExternalForcesEstimator] No force sensors found in the robot model, useFTSensorMeasurements will be reset to false.");
+    useFTSensorMeasurements_ = false;
+  }
+
   addDatastoreCall(const_cast<mc_control::MCController &>(ctl));
 
   mc_rtc::log::info("[ExternalForcesObserver][Init] called with configuration:\n{}", config.dump(true, true));
