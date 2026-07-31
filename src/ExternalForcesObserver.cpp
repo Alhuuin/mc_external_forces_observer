@@ -179,10 +179,7 @@ Eigen::VectorXd ExternalForcesObserver::momentumObserver(const mc_control::MCCon
       [[fallthrough]];
 
     case TorqueSourceType::MotorTorqueMeasurement:
-      if(tau_mes_src_ == TorqueSourceType::MotorTorqueMeasurement)
-      {
         rawTorques = &realRobot.mbc().jointTorque; // Not including rotor inertia effects
-      }
       break;
 
     case TorqueSourceType::CommandedTorque:
@@ -222,12 +219,12 @@ Eigen::VectorXd ExternalForcesObserver::momentumObserver(const mc_control::MCCon
 
   Eigen::MatrixXd C = coriolis.coriolis(realRobot.mb(), realRobot.mbc());
   Eigen::VectorXd Cqdot_plus_g = fd.C();
-  Eigen::VectorXd g = -(C*qdot - Cqdot_plus_g);
+  Eigen::VectorXd g = Cqdot_plus_g - C * qdot;
 
   forceSensorBasedEstimation(ctl);
   
   integralTerm_ += (tau + tau_ext_ft_sensor_ + C.transpose() * qdot - g + tau_momentum_observer_) * ctl.timeStep;
-  tau_momentum_observer_ = residualGain_ * (pt - integralTerm_ + pZero_);
+  tau_momentum_observer_ = residualGain_ * (pt - integralTerm_ - pZero_);
 
   if(tau_ext_ft_sensor_.size() != tau_momentum_observer_.size())
   {
@@ -247,7 +244,6 @@ Eigen::VectorXd ExternalForcesObserver::forceSensorBasedEstimation(const mc_cont
   // Check if the list is empty, which can happen if the robot model doesn't include any force sensors or if there's an issue with loading them
   if(forceSensors.empty())
   {
-    if(useFTSensorMeasurements_) mc_rtc::log::warning("[ExternalForcesEstimator] No force sensors found in the robot model, force sensor based estimation will return zero.");
     return tau_ext_ft_sensor_;
   }
 
