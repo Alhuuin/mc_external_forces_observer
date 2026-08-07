@@ -221,19 +221,24 @@ Eigen::VectorXd ExternalForcesObserver::momentumObserver(const mc_control::MCCon
   Eigen::VectorXd Cqdot_plus_g = fd.C();
   Eigen::VectorXd g = Cqdot_plus_g - C * qdot;
 
-  forceSensorBasedEstimation(ctl);
-  
-  integralTerm_ += (tau + tau_ext_ft_sensor_ + C.transpose() * qdot - g + tau_momentum_observer_) * ctl.timeStep;
+  // Compute sensor-based external torque estimation, nevertheless is used or not, for logging purposes
+  Eigen::VectorXd tau_ft_sensor = forceSensorBasedEstimation(ctl);
+  if(!useFTSensorMeasurements_)
+  {
+    tau_ft_sensor.setZero();
+  }
+
+  integralTerm_ += (tau + tau_ft_sensor + C.transpose() * qdot - g + tau_momentum_observer_) * ctl.timeStep;
   tau_momentum_observer_ = residualGain_ * (pt - integralTerm_ - pZero_);
 
-  if(tau_ext_ft_sensor_.size() != tau_momentum_observer_.size())
+  if(tau_ft_sensor.size() != tau_momentum_observer_.size())
   {
-    mc_rtc::log::error("[ExternalForcesObserver] SIZE MISMATCH: tau_ext_ft_sensor_={} tau_momentum_observer_={}",
-      tau_ext_ft_sensor_.size(), tau_momentum_observer_.size());
+    mc_rtc::log::error("[ExternalForcesObserver] SIZE MISMATCH: tau_ft_sensor={} tau_momentum_observer_={}",
+      tau_ft_sensor.size(), tau_momentum_observer_.size());
     return Eigen::VectorXd::Zero(nDof_);
   }
 
-  return  tau_ext_ft_sensor_ + tau_momentum_observer_;
+  return  tau_ft_sensor + tau_momentum_observer_;
 }
 
 Eigen::VectorXd ExternalForcesObserver::forceSensorBasedEstimation(const mc_control::MCController & ctl)
@@ -247,35 +252,33 @@ Eigen::VectorXd ExternalForcesObserver::forceSensorBasedEstimation(const mc_cont
     return tau_ext_ft_sensor_;
   }
 
-  if(useFTSensorMeasurements_)
+  for(const auto & ft_sensor : realRobot.forceSensors())
   {
-    for(const auto & ft_sensor : realRobot.forceSensors())
-    {
-      // Transformation from parent body origin to sensor frame, used to place
-      // the Jacobian at the exact sensor location rather than the body origin,
-      // ensuring the moment arm is correct
-      const sva::PTransformd & X_p_f = ft_sensor.X_p_f();
-      auto jac = rbd::Jacobian(realRobot.mb(), ft_sensor.parentBody(), X_p_f.translation());
+    // Transformation from parent body origin to sensor frame, used to place
+    // the Jacobian at the exact sensor location rather than the body origin,
+    // ensuring the moment arm is correct
+    const sva::PTransformd & X_p_f = ft_sensor.X_p_f();
+    auto jac = rbd::Jacobian(realRobot.mb(), ft_sensor.parentBody(), X_p_f.translation());
 
-      // World-frame Jacobian (6 x path_dof), then expanded to full robot DoF
-      // so J^T maps a world-frame wrench to all joint torques
-      Eigen::MatrixXd shortJac = jac.jacobian(realRobot.mb(), realRobot.mbc());
-      Eigen::MatrixXd fullJac = Eigen::MatrixXd::Zero(6, nDof_);
-      jac.fullJacobian(realRobot.mb(), shortJac, fullJac);
+    // World-frame Jacobian (6 x path_dof), then expanded to full robot DoF
+    // so J^T maps a world-frame wrench to all joint torques
+    Eigen::MatrixXd shortJac = jac.jacobian(realRobot.mb(), realRobot.mbc());
+    Eigen::MatrixXd fullJac = Eigen::MatrixXd::Zero(6, nDof_);
+    jac.fullJacobian(realRobot.mb(), shortJac, fullJac);
 
-      // wrenchWithoutGravity returns the wrench in the sensor (body) frame.
-      // R.transpose() rotates it to the world frame to match the world-frame
-      // Jacobian — virtual work requires both to be expressed in the same frame
-      const Eigen::Matrix3d & R = realRobot.bodyPosW(ft_sensor.parentBody()).rotation();
-      sva::ForceVecd w = ft_sensor.wrenchWithoutGravity(realRobot);
-      w.force() = R.transpose() * w.force();
-      w.couple() = R.transpose() * w.couple();
+    // wrenchWithoutGravity returns the wrench in the sensor (body) frame.
+    // R.transpose() rotates it to the world frame to match the world-frame
+    // Jacobian — virtual work requires both to be expressed in the same frame
+    const Eigen::Matrix3d & R = realRobot.bodyPosW(ft_sensor.parentBody()).rotation();
+    sva::ForceVecd w = ft_sensor.wrenchWithoutGravity(realRobot);
+    w.force() = R.transpose() * w.force();
+    w.couple() = R.transpose() * w.couple();
 
-      // τ_ext += J^T * F: project the external wrench into joint torque space
-      // and accumulate contributions from all sensors
-      tau_ext_ft_sensor_ += fullJac.transpose() * w.vector();
-    }
+    // τ_ext += J^T * F: project the external wrench into joint torque space
+    // and accumulate contributions from all sensors
+    tau_ext_ft_sensor_ += fullJac.transpose() * w.vector();
   }
+  
   return tau_ext_ft_sensor_;
 }
 
@@ -307,7 +310,7 @@ void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
           resetObserver_ = true;
           isActive_ = !isActive_; 
         }),
-      mc_rtc::gui::Checkbox("Use sensor measurements", useFTSensorMeasurements_),
+      mc_rtc::gui::Checkbox("Use sensor measurements in momentum observer", useFTSensorMeasurements_),
       mc_rtc::gui::NumberInput(
           "Gain", [this]() { return residualGain_; },
           [this](double gain) {
