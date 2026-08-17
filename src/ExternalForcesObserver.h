@@ -55,6 +55,7 @@ enum class EstimationMethod
 {
   MomentumObserver,
   ForceSensorBased,
+  PassivityObserver,
 };
 
 namespace mc_external_forces_observer
@@ -131,10 +132,11 @@ private:
     "JointTorqueMeasurement"
   };
 
-  static constexpr std::array<const char *, 2> estimationMethodNames =
+  static constexpr std::array<const char *, 3> estimationMethodNames =
   {
     "MomentumObserver",
-    "ForceSensorBased"
+    "ForceSensorBased",
+    "PassivityObserver"
   };
 
   static std::string toString(TorqueSourceType src);
@@ -180,11 +182,15 @@ private:
    */
   Eigen::VectorXd forceSensorBasedEstimation(const mc_control::MCController & ctl);
 
+  Eigen::VectorXd passivityObserver(const mc_control::MCController & ctl);
+
   // ── Configuration ───────────────────────────────────────────────────────────
 
   TorqueSourceType tau_mes_src_;   ///< Torque source used by the momentum observer.
   EstimationMethod estimation_method_; ///< Active estimation algorithm.
   double residualGain_;            ///< Observer gain K.
+  double passivityGain_inertia_;
+  double passivityGain_lambda_;
 
   // ── Runtime state ───────────────────────────────────────────────────────────
 
@@ -210,6 +216,8 @@ private:
   Eigen::VectorXd tau_ext_ft_sensor_;
 
   Eigen::VectorXd tau_contact_;
+
+  Eigen::VectorXd tau_passivity_observer_;
   
   bool observerInitialized_ = false; ///< Whether the momentum observer has been initialised with a valid p0.
 
@@ -237,6 +245,13 @@ private:
 
   std::vector<std::string> dofNames_;
   std::vector<std::string> refDofOrder(const rbd::MultiBodyConfig & mbc, const rbd::MultiBody & mb);
+
+  Eigen::VectorXd lowPassFilter(const Eigen::VectorXd& input, double cutoffHz);
+  double cutoffHz_;
+  bool activeLowPassFilter_ = false;
+  Eigen::VectorXd lowPassFilterState_;
+  bool lowPassFilterStateInitialized_ = false;
+
 };
 
 } // namespace mc_external_forces_observer

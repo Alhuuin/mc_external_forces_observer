@@ -45,10 +45,15 @@ void ExternalForcesObserver::configure(const mc_control::MCController & ctl,
   pZero_ = Eigen::VectorXd::Zero(nDof_);
   tau_ext_hat_ = Eigen::VectorXd::Zero(nDof_);
   tau_momentum_observer_ = Eigen::VectorXd::Zero(nDof_);
+  tau_passivity_observer_ = Eigen::VectorXd::Zero(nDof_);
   tau_ext_ft_sensor_ = Eigen::VectorXd::Zero(nDof_);
   integralTerm_ = Eigen::VectorXd::Zero(nDof_);
   tau_contact_ = Eigen::VectorXd::Zero(nDof_);
   resetObserver_ = true;
+
+  cutoffHz_= 0.5 * (1.0 / dt_) - 0.01; // Nyquist frequency
+  double alpha = 1 - std::exp(-2 * M_PI * cutoffHz_ * dt_);
+
   if(ctl.dynamicsConstraint->backend() != mc_solver::QPSolver::Backend::TVM)
   {
     mc_rtc::log::warning(
@@ -97,9 +102,18 @@ bool ExternalForcesObserver::run(const mc_control::MCController & ctl)
   {
     tau_ext_hat_ = forceSensorBasedEstimation(ctl);
   }
+  else if(estimation_method_ == EstimationMethod::PassivityObserver)
+  {
+    tau_ext_hat_ = passivityObserver(ctl);
+  }
   else
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("[ExternalForcesObserver] Invalid estimation method.");
+  }
+
+  if(activeLowPassFilter_)
+  {
+    tau_ext_hat_ = lowPassFilter(tau_ext_hat_, cutoffHz_);
   }
 
   if(tau_ext_hat_.array().isNaN().any() || tau_ext_hat_.array().isInf().any())
@@ -284,6 +298,7 @@ Eigen::VectorXd ExternalForcesObserver::forceSensorBasedEstimation(const mc_cont
     // R.transpose() rotates it to the world frame to match the world-frame
     // Jacobian — virtual work requires both to be expressed in the same frame
     const Eigen::Matrix3d & R = realRobot.bodyPosW(ft_sensor.parentBody()).rotation();
+
     sva::ForceVecd w = ft_sensor.wrenchWithoutGravity(realRobot);
     w.force() = R.transpose() * w.force();
     w.couple() = R.transpose() * w.couple();
@@ -294,6 +309,101 @@ Eigen::VectorXd ExternalForcesObserver::forceSensorBasedEstimation(const mc_cont
   }
   
   return tau_ext_ft_sensor_;
+}
+
+Eigen::VectorXd ExternalForcesObserver::passivityObserver(const mc_control::MCController & ctl)
+{
+  auto & robot = ctl.robots().robot(robot_);
+  auto & realRobot = ctl.realRobot(robot_);
+  Eigen::VectorXd qdot = Eigen::VectorXd::Zero(nDof_);
+  Eigen::VectorXd qddot = Eigen::VectorXd::Zero(nDof_);
+  Eigen::VectorXd tau = Eigen::VectorXd::Zero(nDof_);
+
+  if(robot.encoderVelocities().empty())
+  {
+    mc_rtc::log::warning(
+        "[ExternalForcesObserver] Encoder velocities observer is not available, external forces estimation skipped. Please add an EncoderObserver to the controller configuration with velocity update enabled to use the passivity observer estimation method.");
+    return Eigen::VectorXd::Zero(nDof_);
+  }
+
+  const std::vector<std::vector<double>> * rawTorques = nullptr;
+  switch(tau_mes_src_)
+  {
+    case TorqueSourceType::JointTorqueMeasurement:
+      rawTorques = &realRobot.mbc().jointTorque;
+      break;
+
+    case TorqueSourceType::CurrentMeasurement:
+      mc_rtc::log::warning("[ExternalForcesEstimator] CurrentMeasurement not implemented yet, "
+                          "switching to CommandedTorque source.");
+      // TODO: tau(i) = kt(i) * gear_ratio(i) * realRobot.jointJointSensor(mbIdx).motorCurrent();
+      tau_mes_src_ = TorqueSourceType::CommandedTorque;
+      [[fallthrough]];
+
+    case TorqueSourceType::MotorTorqueMeasurement:
+      if(tau_mes_src_ == TorqueSourceType::MotorTorqueMeasurement)
+      {
+        rawTorques = &realRobot.mbc().jointTorque; // Not including rotor inertia effects
+      }
+      break;
+
+    case TorqueSourceType::CommandedTorque:
+      rawTorques = &robot.mbc().jointTorque;
+      break;
+  }
+
+  mbcToVector(*rawTorques, tau);
+  mbcToVector(realRobot.mbc().alpha, qdot);
+  mbcToVector(robot.mbc().alphaD, qddot);
+
+
+  // Print size of tau and qdot for debugging
+  if(tau.size() != nDof_)
+  {
+    mc_rtc::log::error("[ExternalForcesObserver] Size mismatch: tau.size() = {}, expected nDof_ = {}", tau.size(), nDof_);
+    return Eigen::VectorXd::Zero(nDof_);
+  }
+
+  if(qdot.size() != nDof_)
+  {
+    mc_rtc::log::error("[ExternalForcesObserver] Size mismatch: qdot.size() = {}, expected nDof_ = {}", qdot.size(), nDof_);
+    return Eigen::VectorXd::Zero(nDof_);
+  }
+
+  if(qddot.size() != nDof_)
+  {
+    mc_rtc::log::error("[ExternalForcesObserver] Size mismatch: qddot.size() = {}, expected nDof_ = {}", qddot.size(), nDof_);
+    return Eigen::VectorXd::Zero(nDof_);
+  }
+
+  Eigen::VectorXd qdot_r = qdot + qddot * ctl.timeStep;
+  Eigen::VectorXd s = qdot_r - qdot;
+
+  rbd::ForwardDynamics fd = rbd::ForwardDynamics(realRobot.mb());
+  fd.computeC(realRobot.mb(), realRobot.mbc());
+  fd.computeH(realRobot.mb(), realRobot.mbc());
+   rbd::Coriolis coriolis = rbd::Coriolis(realRobot.mb());
+  Eigen::MatrixXd C = coriolis.coriolis(realRobot.mb(), realRobot.mbc());
+  Eigen::MatrixXd M = fd.H();
+  if (tau_mes_src_ == TorqueSourceType::JointTorqueMeasurement)
+  {
+    // Removing rotor inertia effects
+    M -= fd.HIr();
+  }
+
+  Eigen::MatrixXd K = passivityGain_inertia_ * M + passivityGain_lambda_ * Eigen::MatrixXd::Identity(nDof_, nDof_);
+  Eigen::MatrixXd L = C + K;
+
+  tau_passivity_observer_ = tau + L * s;
+
+  if(tau_ext_ft_sensor_.size() != tau_passivity_observer_.size())
+  {
+    mc_rtc::log::error("[ExternalForcesObserver] SIZE MISMATCH: tau_ext_ft_sensor_={} tau_passivity_observer_={}",
+      tau_ext_ft_sensor_.size(), tau_passivity_observer_.size());
+    return Eigen::VectorXd::Zero(nDof_);
+  }
+
+  return tau_passivity_observer_;
 }
 
 void ExternalForcesObserver::loadConfig(const mc_rtc::Configuration & config)
@@ -309,6 +419,8 @@ void ExternalForcesObserver::loadConfig(const mc_rtc::Configuration & config)
   estimation_method_ = toEstimationMethod(config("estimation_method", std::string("MomentumObserver")));
   useFTSensorMeasurements_ = config("use_forces_from_ft_sensors", true);
   isActive_ = config("is_active", true);
+  passivityGain_inertia_ = config("passivity_gain", 15.0);
+  passivityGain_lambda_ = config("passivity_gain_lambda", 10.0);
 }
 
 void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
@@ -325,8 +437,16 @@ void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
           isActive_ = !isActive_; 
         }),
       mc_rtc::gui::Checkbox("Use sensor measurements in momentum observer", useFTSensorMeasurements_),
+      mc_rtc::gui::Checkbox("Active low-pass filter", 
+        [this]() { return activeLowPassFilter_; },
+          [this]() { 
+            activeLowPassFilter_ = !activeLowPassFilter_;
+            if(!activeLowPassFilter_) lowPassFilterStateInitialized_ = false;
+          }),
+      mc_rtc::gui::NumberInput("Low-pass filter cutoff frequency (Hz)", cutoffHz_),
+            
       mc_rtc::gui::NumberInput(
-          "Gain", [this]() { return residualGain_; },
+          "Momentum Gain", [this]() { return residualGain_; },
           [this](double gain) {
             if(gain != residualGain_)
             {
@@ -334,6 +454,27 @@ void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
             }
             residualGain_ = gain;
           }),
+
+      mc_rtc::gui::NumberInput(
+          "Passivity Inertia Gain", [this]() { return passivityGain_inertia_; },
+          [this](double gain) {
+            if(gain != passivityGain_inertia_)
+            {
+              resetObserver_ = true;
+            }
+            passivityGain_inertia_ = gain;
+          }),
+
+      mc_rtc::gui::NumberInput(
+          "Passivity Lambda Gain", [this]() { return passivityGain_lambda_; },
+          [this](double gain) {
+            if(gain != passivityGain_lambda_)
+            {
+              resetObserver_ = true;
+            }
+            passivityGain_lambda_ = gain;
+          }),
+
       mc_rtc::gui::ComboInput(
       "Estimation Mode",
       std::vector<std::string>(
@@ -368,7 +509,9 @@ void ExternalForcesObserver::addToGUI(const mc_control::MCController & ctl,
       mc_rtc::gui::ArrayLabel("Torque Ext from Force Sensors", dofNames_,
                               [this]() { return tau_ext_ft_sensor_; }),
       mc_rtc::gui::ArrayLabel("Torque Contact Compensation", dofNames_,
-                              [this]() { return tau_contact_; })
+                              [this]() { return tau_contact_; }),
+      mc_rtc::gui::ArrayLabel("Torque Passivity Observer", dofNames_,
+                              [this]() { return tau_passivity_observer_; })
       );
 }
 
@@ -379,7 +522,10 @@ void ExternalForcesObserver::addToLogger(const mc_control::MCController & /* ctl
   logger.addLogEntry(category + "_gain", this, [this]() { return residualGain_; });
   logger.addLogEntry(category + "_isActive", this, [this]() { return isActive_; });
   logger.addLogEntry(category + "_useFTSensorMeasurements", this, [this]() { return useFTSensorMeasurements_; });
-
+  logger.addLogEntry(category + "_estimationMethod", this, [this]() { return toString(estimation_method_); });
+  logger.addLogEntry(category + "_torqueSourceType", this, [this]() { return toString(tau_mes_src_); });
+  logger.addLogEntry(category + "_passivityGainInertia", this, [this]() { return passivityGain_inertia_; });
+  logger.addLogEntry(category + "_passivityGainLambda", this, [this]() { return passivityGain_lambda_; });
   for(size_t i = 0; i < dofNames_.size(); ++i)
   {
     logger.addLogEntry(category + "_tauExtHat_" + dofNames_[i], this, [this, i]() { return tau_ext_hat_(i); });
@@ -387,6 +533,7 @@ void ExternalForcesObserver::addToLogger(const mc_control::MCController & /* ctl
     logger.addLogEntry(category + "_integralTerm_" + dofNames_[i], this, [this, i]() { return integralTerm_(i); });
     logger.addLogEntry(category + "_tauExtFtSensor_" + dofNames_[i], this, [this, i]() { return tau_ext_ft_sensor_(i); });
     logger.addLogEntry(category + "_tauContact_" + dofNames_[i], this, [this, i]() { return tau_contact_(i); });
+    logger.addLogEntry(category + "_tauPassivityObserver_" + dofNames_[i], this, [this, i]() { return tau_passivity_observer_(i); });
   }
 }
 
@@ -488,6 +635,27 @@ std::vector<std::string> ExternalForcesObserver::refDofOrder(const rbd::MultiBod
     mc_rtc::log::error_and_throw<std::runtime_error>("[ExternalForcesObserver] Inconsistent DoF count");
   }
   return dofNames;
+}
+
+Eigen::VectorXd ExternalForcesObserver::lowPassFilter(const Eigen::VectorXd& input, double cutoffHz)
+{
+  double sampleRateHz = 1.0 / dt_;
+
+  if (cutoffHz <= 0.0 || cutoffHz >= sampleRateHz / 2.0)
+      throw std::invalid_argument("Cutoff frequency must be between 0 and Nyquist.");
+
+  if (!lowPassFilterStateInitialized_)
+  {
+      lowPassFilterState_ = input;
+      lowPassFilterStateInitialized_ = true;
+      return lowPassFilterState_;
+  }
+
+  const double alpha = 1 - std::exp(-2 * M_PI * cutoffHz_ * dt_);
+
+  lowPassFilterState_ = lowPassFilterState_ + alpha * (input - lowPassFilterState_);
+  
+  return lowPassFilterState_;
 }
 
 } // namespace mc_external_forces_observer
